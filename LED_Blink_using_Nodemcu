@@ -1,0 +1,34 @@
+/* Blynk credentials */
+#define BLYNK_TEMPLATE_ID "Your_Template_ID"
+#define BLYNK_TEMPLATE_NAME "LED Control"
+#define BLYNK_AUTH_TOKEN "Your_Auth_Token"
+
+#define BLYNK_PRINT Serial
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+
+/* WiFi credentials */
+char ssid[] = "Your_WiFi_Name";
+char pass[] = "Your_WiFi_Password";
+
+#define LED_PIN D2   // GPIO4
+
+void setup()
+{
+  Serial.begin(9600);
+  pinMode(LED_PIN, OUTPUT);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+}
+
+/* Button widget on V1 */
+BLYNK_WRITE(V1)
+{
+  int ledState = param.asInt(); // 1 or 0
+  digitalWrite(LED_PIN, ledState);
+}
+
+void loop()
+{
+  Blynk.run();
+}
