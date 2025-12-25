@@ -1,0 +1,105 @@
+// -------- Segment Pins (A B C D E F G) --------
+int segmentPins[7] = {8, 6, 10, 11, 12, 7, 9};
+
+// -------- Digit Control Pins (D1 D2 D3 D4) --------
+int digitPins[4] = {5, 4, 3, 2};
+
+// -------- Button Pins --------
+#define START_BTN A0
+#define STOP_BTN  A1
+#define RESET_BTN A2
+
+// -------- LED Pin --------
+#define LED_PIN   A3
+
+// -------- Number Patterns (Common Cathode) --------
+byte numbers[10][7] = {
+  {1,1,1,1,1,1,0}, // 0
+  {0,1,1,0,0,0,0}, // 1
+  {1,1,0,1,1,0,1}, // 2
+  {1,1,1,1,0,0,1}, // 3
+  {0,1,1,0,0,1,1}, // 4
+  {1,0,1,1,0,1,1}, // 5
+  {1,0,1,1,1,1,1}, // 6
+  {1,1,1,0,0,0,0}, // 7
+  {1,1,1,1,1,1,1}, // 8
+  {1,1,1,1,0,1,1}  // 9
+};
+
+unsigned long previousMillis = 0;
+int countdownSeconds = 20;
+bool timerRunning = false;
+
+void setup() {
+  // Segment pins
+  for (int i = 0; i < 7; i++) {
+    pinMode(segmentPins[i], OUTPUT);
+  }
+
+  // Digit pins
+  for (int i = 0; i < 4; i++) {
+    pinMode(digitPins[i], OUTPUT);
+    digitalWrite(digitPins[i], HIGH); // OFF
+  }
+
+  // Buttons
+  pinMode(START_BTN, INPUT_PULLUP);
+  pinMode(STOP_BTN, INPUT_PULLUP);
+  pinMode(RESET_BTN, INPUT_PULLUP);
+
+  // LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void loop() {
+  // -------- Button Control --------
+  if (digitalRead(START_BTN) == LOW) {
+    timerRunning = true;
+    delay(200);
+  }
+
+  if (digitalRead(STOP_BTN) == LOW) {
+    timerRunning = false;
+    delay(200);
+  }
+
+  if (digitalRead(RESET_BTN) == LOW) {
+    countdownSeconds = 20;
+    timerRunning = false;
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+
+  // -------- Countdown Logic --------
+  if (timerRunning && millis() - previousMillis >= 1000) {
+    previousMillis = millis();
+    if (countdownSeconds > 0) {
+      countdownSeconds--;
+    } else {
+      timerRunning = false;
+      digitalWrite(LED_PIN, HIGH); // TIMER END → LED ON
+    }
+  }
+
+  displayNumber(countdownSeconds);
+}
+
+// -------- Display Number --------
+void displayNumber(int num) {
+  int digits[4] = {0, 0, num / 10, num % 10};
+
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(digitPins[i], LOW);
+    showDigit(digits[i]);
+    delay(4);
+    digitalWrite(digitPins[i], HIGH);
+  }
+}
+
+// -------- Show Single Digit --------
+void showDigit(int n) {
+  for (int i = 0; i < 7; i++) {
+    digitalWrite(segmentPins[i], numbers[n][i]);
+  }
+}
