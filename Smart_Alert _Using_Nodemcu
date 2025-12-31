@@ -1,0 +1,65 @@
+#define BLYNK_PRINT Serial
+
+#define BLYNK_TEMPLATE_ID "TMPL3cgTWVb6E"
+#define BLYNK_TEMPLATE_NAME "smart alert using laser"
+#define BLYNK_AUTH_TOKEN "q51MQcBoaf48g5MyVCFTefPf1DX5jD6A"
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+
+// 🔴 WiFi credentials
+char ssid[] = "nani";
+char pass[] = "123456789";
+
+#define LDR_PIN A0
+#define RED_LED D5
+#define BLUE_LED D6
+
+int threshold = 600;      // Adjust based on your LDR readings
+bool alertSent = false;
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+
+  digitalWrite(BLUE_LED, HIGH);   // SAFE
+  digitalWrite(RED_LED, LOW);
+
+  // Connect to Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+}
+
+void loop() {
+  Blynk.run();
+
+  int ldrValue = analogRead(LDR_PIN);
+  Serial.print("LDR Value: ");
+  Serial.println(ldrValue);
+
+  if (ldrValue < threshold) {
+    // 🚨 ALERT STATE
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(BLUE_LED, LOW);
+
+    Blynk.virtualWrite(V1, "🚨 ALERT! ENEMY SPOTTED!!");
+    Blynk.virtualWrite(V2, 1);
+
+    if (!alertSent) {
+      Blynk.logEvent("laser_alert", "Laser beam interrupted!");
+      alertSent = true;
+    }
+
+  } else {
+    // ✅ SAFE STATE
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(BLUE_LED, HIGH);
+
+    Blynk.virtualWrite(V1, "✅ SAFE");
+    Blynk.virtualWrite(V2, 0);
+    alertSent = false;
+  }
+
+  delay(500);
+}
