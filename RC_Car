@@ -1,0 +1,132 @@
+#define BLYNK_PRINT Serial
+
+// ===== BLYNK DETAILS =====
+#define BLYNK_TEMPLATE_ID "TMPLxxxxxxx"
+#define BLYNK_TEMPLATE_NAME "WiFi Car"
+#define BLYNK_AUTH_TOKEN "YOUR_BLYNK_AUTH_TOKEN"
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+
+// ===== WIFI =====
+char ssid[] = "YOUR_WIFI_NAME";
+char pass[] = "YOUR_WIFI_PASSWORD";
+
+// ===== MOTOR PINS =====
+#define IN1 D1
+#define IN2 D2
+#define IN3 D3
+#define IN4 D4
+#define ENA D5
+#define ENB D6
+
+// ===== MODULES =====
+#define BUZZER D7          // ACTIVE BUZZER
+#define LED    D0          // moved from D8 (important)
+
+// ===== VARIABLES =====
+int speedPWM = 700;
+bool fwd = false, back = false, left = false, right = false;
+
+// ===== STOP CAR =====
+void stopCar() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+// ===== APPLY MOVEMENT =====
+void applyMovement() {
+
+  int leftSpeed = speedPWM;
+  int rightSpeed = speedPWM;
+
+  if (!fwd && !back && !left && !right) {
+    stopCar();
+    return;
+  }
+
+  // FORWARD
+  if (fwd) {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+
+    if (left && !right)  leftSpeed  = speedPWM / 2;
+    if (right && !left)  rightSpeed = speedPWM / 2;
+  }
+
+  // BACKWARD
+  else if (back) {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+
+    if (left && !right)  leftSpeed  = speedPWM / 2;
+    if (right && !left)  rightSpeed = speedPWM / 2;
+  }
+
+  // ROTATE LEFT
+  else if (left) {
+    digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  }
+
+  // ROTATE RIGHT
+  else if (right) {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  }
+
+  analogWrite(ENA, leftSpeed);
+  analogWrite(ENB, rightSpeed);
+}
+
+// ===== BLYNK CONTROLS =====
+BLYNK_WRITE(V0) { fwd  = param.asInt(); applyMovement(); }
+BLYNK_WRITE(V1) { back = param.asInt(); applyMovement(); }
+BLYNK_WRITE(V2) { left = param.asInt(); applyMovement(); }
+BLYNK_WRITE(V3) { right= param.asInt(); applyMovement(); }
+
+// ===== HORN (ACTIVE BUZZER) =====
+BLYNK_WRITE(V4) {
+  if (param.asInt()) {
+    digitalWrite(BUZZER, HIGH);
+  } else {
+    digitalWrite(BUZZER, LOW);
+  }
+}
+
+// ===== HEADLIGHT =====
+BLYNK_WRITE(V5) {
+  digitalWrite(LED, param.asInt() ? HIGH : LOW);
+}
+
+// ===== SPEED CONTROL =====
+BLYNK_WRITE(V6) {
+  speedPWM = constrain(param.asInt(), 300, 1023);
+  applyMovement();
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+
+  pinMode(BUZZER, OUTPUT);
+  pinMode(LED, OUTPUT);
+
+  digitalWrite(BUZZER, LOW);
+  digitalWrite(LED, LOW);
+
+  stopCar();
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+}
+
+// ===== LOOP =====
+void loop() {
+  Blynk.run();
+}
