@@ -1,0 +1,62 @@
+#include <Servo.h>
+
+Servo shoulderServo;
+Servo elbowServo;
+Servo wristServo;
+
+#define JOY_X A0
+#define JOY_Y A1
+#define JOY_SW 2
+
+int shoulderAngle = 90;
+int elbowAngle = 90;
+int wristAngle = 90;
+
+const int deadZone = 60;
+const int stepSize = 1;
+
+void setup() {
+  shoulderServo.attach(5);
+  elbowServo.attach(6);
+  wristServo.attach(9);
+
+  pinMode(JOY_SW, INPUT_PULLUP);
+
+  shoulderServo.write(shoulderAngle);
+  elbowServo.write(elbowAngle);
+  wristServo.write(wristAngle);
+}
+
+void loop() {
+  int xVal = analogRead(JOY_X);
+  int yVal = analogRead(JOY_Y);
+  bool buttonPressed = (digitalRead(JOY_SW) == LOW);
+
+  // Shoulder: LEFT - RIGHT
+  if (!buttonPressed) {
+    if (xVal > 512 + deadZone) shoulderAngle += stepSize;
+    if (xVal < 512 - deadZone) shoulderAngle -= stepSize;
+  }
+
+  // Elbow: UP - DOWN
+  if (!buttonPressed) {
+    if (yVal > 512 + deadZone) elbowAngle += stepSize;
+    if (yVal < 512 - deadZone) elbowAngle -= stepSize;
+  }
+
+  // Wrist: BUTTON PRESSED → AUTO MOVE
+  if (buttonPressed) {
+    wristAngle += stepSize;
+    if (wristAngle > 180) wristAngle = 0; // rotate back
+  }
+
+  shoulderAngle = constrain(shoulderAngle, 0, 180);
+  elbowAngle = constrain(elbowAngle, 0, 180);
+  wristAngle = constrain(wristAngle, 0, 180);
+
+  shoulderServo.write(shoulderAngle);
+  elbowServo.write(elbowAngle);
+  wristServo.write(wristAngle);
+
+  delay(20);
+}
