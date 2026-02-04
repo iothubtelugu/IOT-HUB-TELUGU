@@ -1,0 +1,87 @@
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <ESP32Servo.h>
+
+// -------- BLYNK DETAILS ----------
+char auth[] = "YOUR_BLYNK_AUTH_TOKEN";
+char ssid[] = "YOUR_WIFI_NAME";
+char pass[] = "YOUR_WIFI_PASSWORD";
+
+// -------- SERVO OBJECTS ----------
+Servo baseServo;
+Servo shoulderServo;
+Servo elbowServo;
+Servo wristServo;
+Servo gripperServo;
+
+// -------- SERVO PINS ----------
+#define BASE_PIN     13
+#define SHOULDER_PIN 12
+#define ELBOW_PIN    14
+#define WRIST_PIN    27
+#define GRIPPER_PIN  26
+
+// -------- JOYSTICK PINS ----------
+#define J1_X 34
+#define J1_Y 35
+#define J2_X 32
+#define J2_Y 33
+
+// -------- SERVO ANGLES ----------
+int baseAngle = 90;
+int shoulderAngle = 90;
+int elbowAngle = 90;
+int wristAngle = 90;
+int gripperAngle = 40;
+
+// -------- BLYNK SLIDERS ----------
+BLYNK_WRITE(V0) { baseAngle = param.asInt(); }
+BLYNK_WRITE(V1) { shoulderAngle = param.asInt(); }
+BLYNK_WRITE(V2) { elbowAngle = param.asInt(); }
+BLYNK_WRITE(V3) { wristAngle = param.asInt(); }
+BLYNK_WRITE(V4) { gripperAngle = param.asInt(); }
+
+void setup() {
+  Serial.begin(115200);
+
+  Blynk.begin(auth, ssid, pass);
+
+  baseServo.attach(BASE_PIN);
+  shoulderServo.attach(SHOULDER_PIN);
+  elbowServo.attach(ELBOW_PIN);
+  wristServo.attach(WRIST_PIN);
+  gripperServo.attach(GRIPPER_PIN);
+
+  baseServo.write(baseAngle);
+  shoulderServo.write(shoulderAngle);
+  elbowServo.write(elbowAngle);
+  wristServo.write(wristAngle);
+  gripperServo.write(gripperAngle);
+}
+
+void loop() {
+  Blynk.run();
+
+  // -------- READ JOYSTICKS ----------
+  int j1x = analogRead(J1_X);
+  int j1y = analogRead(J1_Y);
+  int j2x = analogRead(J2_X);
+  int j2y = analogRead(J2_Y);
+
+  // -------- MAP TO SERVO ANGLES ----------
+  baseAngle     = map(j1x, 0, 4095, 0, 180);
+  shoulderAngle = map(j1y, 0, 4095, 0, 180);
+  wristAngle    = map(j2x, 0, 4095, 0, 180);
+  elbowAngle    = map(j2y, 0, 4095, 0, 180);
+
+  // -------- WRITE SERVOS ----------
+  baseServo.write(baseAngle);
+  shoulderServo.write(shoulderAngle);
+  elbowServo.write(elbowAngle);
+  wristServo.write(wristAngle);
+  gripperServo.write(gripperAngle);
+
+  delay(15); // smooth movement
+}
