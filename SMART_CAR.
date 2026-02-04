@@ -1,0 +1,130 @@
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+// -------- BLYNK ----------
+char auth[] = "YOUR_BLYNK_AUTH";
+char ssid[] = "YOUR_WIFI";
+char pass[] = "YOUR_PASS";
+
+// -------- MPU ----------
+MPU6050 mpu;
+int16_t ax, ay;
+
+// -------- MODE ----------
+int mode = 1; // 1-Gyro | 2-Blynk | 3-Auto
+
+// -------- L298N ----------
+#define ENA 25
+#define IN1 26
+#define IN2 27
+#define ENB 14
+#define IN3 12
+#define IN4 13
+
+// -------- ULTRASONIC ----------
+#define TRIG 33
+#define ECHO 32
+
+// -------- BLYNK BUTTONS ----------
+int fwd, back, left, right;
+
+BLYNK_WRITE(V0) { mode = param.asInt(); }
+BLYNK_WRITE(V1) { fwd = param.asInt(); }
+BLYNK_WRITE(V2) { back = param.asInt(); }
+BLYNK_WRITE(V3) { left = param.asInt(); }
+BLYNK_WRITE(V4) { right = param.asInt(); }
+
+// -------- MOTOR FUNCTIONS ----------
+void stopCar() {
+  digitalWrite(IN1,0); digitalWrite(IN2,0);
+  digitalWrite(IN3,0); digitalWrite(IN4,0);
+}
+
+void forward() {
+  digitalWrite(IN1,1); digitalWrite(IN2,0);
+  digitalWrite(IN3,1); digitalWrite(IN4,0);
+}
+
+void backward() {
+  digitalWrite(IN1,0); digitalWrite(IN2,1);
+  digitalWrite(IN3,0); digitalWrite(IN4,1);
+}
+
+void turnLeft() {
+  digitalWrite(IN1,0); digitalWrite(IN2,1);
+  digitalWrite(IN3,1); digitalWrite(IN4,0);
+}
+
+void turnRight() {
+  digitalWrite(IN1,1); digitalWrite(IN2,0);
+  digitalWrite(IN3,0); digitalWrite(IN4,1);
+}
+
+// -------- DISTANCE ----------
+long getDistance() {
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  return pulseIn(ECHO, HIGH) * 0.034 / 2;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Blynk.begin(auth, ssid, pass);
+
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
+  pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  pinMode(ENA,OUTPUT); pinMode(ENB,OUTPUT);
+
+  pinMode(TRIG,OUTPUT);
+  pinMode(ECHO,INPUT);
+
+  analogWrite(ENA, 180);
+  analogWrite(ENB, 180);
+
+  Wire.begin();
+  mpu.initialize();
+}
+
+void loop() {
+  Blynk.run();
+
+  // -------- MODE 1: GYRO ----------
+  if (mode == 1) {
+    mpu.getAcceleration(&ax, &ay, NULL);
+
+    if (ay > 7000) forward();
+    else if (ay < -7000) backward();
+    else if (ax > 7000) turnRight();
+    else if (ax < -7000) turnLeft();
+    else stopCar();
+  }
+
+  // -------- MODE 2: BLYNK ----------
+  else if (mode == 2) {
+    if (fwd) forward();
+    else if (back) backward();
+    else if (left) turnLeft();
+    else if (right) turnRight();
+    else stopCar();
+  }
+
+  // -------- MODE 3: OBSTACLE ----------
+  else if (mode == 3) {
+    long d = getDistance();
+    if (d < 20) {
+      stopCar();
+      delay(300);
+      turnRight();
+      delay(400);
+    } else {
+      forward();
+    }
+  }
+}
