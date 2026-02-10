@@ -1,0 +1,58 @@
+#define BLYNK_PRINT Serial
+
+// -------- Blynk Credentials --------
+#define BLYNK_TEMPLATE_ID "TMPL3SIKzk4ZM"
+#define BLYNK_TEMPLATE_NAME "Weather Monitoring"
+#define BLYNK_AUTH_TOKEN "gKaaGwmoPMn0kPUQqJntdrm4w0WBvaOp"
+
+// -------- Libraries --------
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <DHT.h>
+
+// -------- WiFi Credentials --------
+char ssid[] = "nani";
+char pass[] = "123456789";
+
+// -------- DHT Settings --------
+#define DHTPIN D5        // GPIO2
+#define DHTTYPE DHT11
+
+DHT dht(DHTPIN, DHTTYPE);
+BlynkTimer timer;
+
+// -------- Read DHT11 --------
+void readDHT() {
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature(); // Celsius
+
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println("Failed to read from DHT sensor!");
+    return;
+  }
+
+  Serial.print("Temp: ");
+  Serial.print(temperature);
+  Serial.print(" °C  |  Humidity: ");
+  Serial.print(humidity);
+  Serial.println(" %");
+
+  // Send to Blynk
+  Blynk.virtualWrite(V0, temperature);
+  Blynk.virtualWrite(V1, humidity);
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  dht.begin();
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // Read sensor every 2 seconds
+  timer.setInterval(2000L, readDHT);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+}
