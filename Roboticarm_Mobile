@@ -1,0 +1,106 @@
+#define BLYNK_PRINT Serial
+
+#define BLYNK_TEMPLATE_ID   "TMPLXXXXXX"
+#define BLYNK_TEMPLATE_NAME "Robotic Arm"
+#define BLYNK_AUTH_TOKEN    "YOUR_AUTH_TOKEN"
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <Servo.h>
+
+char ssid[] = "YOUR_WIFI";
+char pass[] = "YOUR_PASSWORD";
+
+// -------- Servo Pins --------
+#define BASE_PIN     D1   // MG995
+#define SHOULDER_PIN D2   // MG996R
+#define ELBOW_PIN    D5   // MG996R
+#define WRIST_PIN    D6   // SG90
+
+BlynkTimer timer;
+
+// -------- Servos --------
+Servo baseServo;
+Servo shoulderServo;
+Servo elbowServo;
+Servo wristServo;
+
+// -------- Positions --------
+int basePos = 90;
+int shoulderPos = 90;
+int elbowPos = 90;
+int wristPos = 90;
+
+// -------- Button States --------
+bool basePlus=false, baseMinus=false;
+bool shPlus=false, shMinus=false;
+bool elPlus=false, elMinus=false;
+bool wrPlus=false, wrMinus=false;
+
+// -------- Blynk Buttons --------
+// Shoulder
+BLYNK_WRITE(V1){ shPlus  = param.asInt(); }
+BLYNK_WRITE(V2){ shMinus = param.asInt(); }
+
+// Elbow
+BLYNK_WRITE(V3){ elPlus  = param.asInt(); }
+BLYNK_WRITE(V4){ elMinus = param.asInt(); }
+
+// Wrist
+BLYNK_WRITE(V5){ wrPlus  = param.asInt(); }
+BLYNK_WRITE(V6){ wrMinus = param.asInt(); }
+
+// Base (NEW MG995)
+BLYNK_WRITE(V7){ basePlus  = param.asInt(); }
+BLYNK_WRITE(V8){ baseMinus = param.asInt(); }
+
+// -------- Update Servos --------
+void updateServos() {
+
+  // ---- BASE (MG995) ----
+  if (basePlus && !baseMinus && basePos < 170) basePos++;
+  else if (baseMinus && !basePlus && basePos > 10) basePos--;
+
+  // ---- SHOULDER ----
+  if (shPlus && !shMinus && shoulderPos < 165) shoulderPos++;
+  else if (shMinus && !shPlus && shoulderPos > 15) shoulderPos--;
+
+  // ---- ELBOW ----
+  if (elPlus && !elMinus && elbowPos < 155) elbowPos++;
+  else if (elMinus && !elPlus && elbowPos > 25) elbowPos--;
+
+  // ---- WRIST ----
+  if (wrPlus && !wrMinus && wristPos < 180) wristPos++;
+  else if (wrMinus && !wrPlus && wristPos > 0) wristPos--;
+
+  baseServo.write(basePos);
+  shoulderServo.write(shoulderPos);
+  elbowServo.write(elbowPos);
+  wristServo.write(wristPos);
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  // High torque servos
+  baseServo.attach(BASE_PIN, 600, 2400);       // MG995
+  shoulderServo.attach(SHOULDER_PIN, 600, 2400); // MG996R
+  elbowServo.attach(ELBOW_PIN, 600, 2400);       // MG996R
+
+  // Micro servo
+  wristServo.attach(WRIST_PIN, 700, 2300);     // SG90
+
+  baseServo.write(basePos);
+  shoulderServo.write(shoulderPos);
+  elbowServo.write(elbowPos);
+  wristServo.write(wristPos);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  timer.setInterval(40L, updateServos);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+}
