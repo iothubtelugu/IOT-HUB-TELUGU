@@ -1,0 +1,45 @@
+#include <Servo.h>
+
+Servo thumb;
+Servo thumbGrip;
+Servo indexF;
+Servo middleF;
+Servo ringLittle;
+
+void setup() {
+  Serial.begin(9600);
+
+  thumb.attach(3);
+  thumbGrip.attach(4);
+  indexF.attach(5);
+  middleF.attach(6);
+  ringLittle.attach(9);
+}
+
+void loop() {
+
+  if (Serial.available() > 0) {
+
+    String data = Serial.readStringUntil('\n');
+
+    int values[5];
+    int i = 0;
+
+    while (data.length() > 0 && i < 5) {
+      int commaIndex = data.indexOf(',');
+      if (commaIndex == -1) {
+        values[i] = data.toInt();
+        break;
+      }
+      values[i] = data.substring(0, commaIndex).toInt();
+      data = data.substring(commaIndex + 1);
+      i++;
+    }
+
+    thumb.write(values[0]);
+    thumbGrip.write(values[1]);
+    indexF.write(values[2]);
+    middleF.write(values[3]);
+    ringLittle.write(values[4]);
+  }
+}
