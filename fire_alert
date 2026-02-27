@@ -1,0 +1,196 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Servo.h>
+#include <DHT.h>
+
+// ================= WIFI =================
+const char* ssid = "nani";
+const char* password = "123456789";
+
+// ================= PIN DEFINITIONS =================
+#define FLAME_SENSOR   D5
+#define DHTPIN         D4
+#define DHTTYPE        DHT11
+
+#define SCAN_SERVO_PIN D1
+#define SPRAY_SERVO_PIN D2
+
+#define RELAY_PIN      D0   // Active LOW Relay
+#define RED_LED        D7
+#define BLUE_LED       D8
+#define BUZZER         D3
+
+// ================= OBJECTS =================
+ESP8266WebServer server(80);
+Servo scanServo;
+Servo sprayServo;
+DHT dht(DHTPIN, DHTTYPE);
+
+// ================= SYSTEM VARIABLES =================
+int currentAngle = 30;
+int stepAngle = 2;
+int fireAngle = 90;
+
+bool fireLocked = false;
+
+float temperature = 0;
+const float TEMP_THRESHOLD = 45.0;
+
+// Dashboard variables
+String flameStatus = "SAFE";
+String systemMode = "Scanning";
+String pumpStatus = "OFF";
+String buzzerStatus = "OFF";
+
+// ================= DASHBOARD FUNCTION =================
+String getHTML() {
+
+  String flameColor = (flameStatus == "FIRE DETECTED") ? "#ff3b3b" : "#00e676";
+  String pumpColor  = (pumpStatus == "ON") ? "#ff9800" : "#00e676";
+  String buzColor   = (buzzerStatus == "ON") ? "#ff3b3b" : "#00e676";
+
+  String html = "<!DOCTYPE html><html>";
+  html += "<head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='2'>";
+  html += "<title>Smart Fire Turret</title>";
+
+  html += "<style>";
+  html += "body{margin:0;font-family:Segoe UI,sans-serif;background:#0f172a;color:white;text-align:center;}";
+  html += "h1{padding:20px 0;color:#ff3b3b;}";
+  html += ".container{display:flex;flex-wrap:wrap;justify-content:center;}";
+  html += ".card{background:#1e293b;margin:15px;padding:25px;border-radius:15px;width:260px;";
+  html += "box-shadow:0 0 15px rgba(0,0,0,0.4);}";
+  html += ".value{font-size:24px;font-weight:bold;margin-top:10px;}";
+  html += ".dot{height:15px;width:15px;border-radius:50%;display:inline-block;margin-right:8px;}";
+  html += "</style></head><body>";
+
+  html += "<h1>SMART FIRE TURRET DASHBOARD</h1>";
+  html += "<div class='container'>";
+
+  html += "<div class='card'><h3>Temperature</h3>";
+  html += "<div class='value'>" + String(temperature) + " C</div></div>";
+
+  html += "<div class='card'><h3>Flame Status</h3>";
+  html += "<div class='value'><span class='dot' style='background:" + flameColor + "'></span>";
+  html += flameStatus + "</div></div>";
+
+  html += "<div class='card'><h3>System Mode</h3>";
+  html += "<div class='value'>" + systemMode + "</div></div>";
+
+  html += "<div class='card'><h3>Pump Status</h3>";
+  html += "<div class='value'><span class='dot' style='background:" + pumpColor + "'></span>";
+  html += pumpStatus + "</div></div>";
+
+  html += "<div class='card'><h3>Buzzer Status</h3>";
+  html += "<div class='value'><span class='dot' style='background:" + buzColor + "'></span>";
+  html += buzzerStatus + "</div></div>";
+
+  html += "<div class='card'><h3>Locked Angle</h3>";
+  html += "<div class='value'>" + String(fireAngle) + " deg</div></div>";
+
+  html += "</div></body></html>";
+
+  return html;
+}
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(9600);
+
+  pinMode(FLAME_SENSOR, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  // Ensure relay OFF at startup (Active LOW)
+  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(BUZZER, LOW);
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(BLUE_LED, HIGH);
+
+  scanServo.attach(SCAN_SERVO_PIN);
+  sprayServo.attach(SPRAY_SERVO_PIN);
+  dht.begin();
+
+  scanServo.write(currentAngle);
+  sprayServo.write(90);
+
+  // WiFi connect
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nConnected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", []() {
+    server.send(200, "text/html", getHTML());
+  });
+
+  server.begin();
+}
+
+// ================= LOOP =================
+void loop() {
+
+  server.handleClient();
+
+  int flameState = digitalRead(FLAME_SENSOR);
+  temperature = dht.readTemperature();
+  if (isnan(temperature)) temperature = 0;
+
+  // ================= FIRE DETECTION =================
+  if (flameState == LOW || temperature > TEMP_THRESHOLD) {
+
+    flameStatus = "FIRE DETECTED";
+    systemMode = "Fire Locked";
+    pumpStatus = "ON";
+    buzzerStatus = "ON";
+
+    digitalWrite(RELAY_PIN, LOW);   // Active LOW relay ON
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(BLUE_LED, LOW);
+    digitalWrite(BUZZER, HIGH);
+
+    if (!fireLocked) {
+      fireAngle = currentAngle;
+      fireLocked = true;
+    }
+
+    scanServo.write(fireAngle);
+    sprayServo.write(fireAngle);
+  }
+
+  // ================= NORMAL SCANNING =================
+  else {
+
+    flameStatus = "SAFE";
+    systemMode = "Scanning";
+    pumpStatus = "OFF";
+    buzzerStatus = "OFF";
+
+    digitalWrite(RELAY_PIN, HIGH);  // OFF
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(BLUE_LED, HIGH);
+    digitalWrite(BUZZER, LOW);
+
+    fireLocked = false;
+
+    currentAngle += stepAngle;
+
+    if (currentAngle >= 150 || currentAngle <= 30) {
+      stepAngle = -stepAngle;
+    }
+
+    scanServo.write(currentAngle);
+    delay(20);
+  }
+}
