@@ -1,0 +1,123 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <ESP32Servo.h>
+
+Servo baseServo, shoulderServo, elbowServo, wristServo;
+Servo rotateServo, gripperServo;
+
+int baseAngle = 90;
+int shoulderAngle = 50;
+int elbowAngle = 60;
+int wristAngle = 90;
+int rotateAngle = 90;
+int gripperAngle = 0;
+
+int baseCurrent = 90;
+int shoulderCurrent = 50;
+int elbowCurrent = 60;
+int wristCurrent = 90;
+int rotateCurrent = 90;
+
+typedef struct {
+  int j1x;
+  int j1y;
+  int j2x;
+  int j2y;
+  bool rotCW;
+  bool rotCCW;
+  bool openGrip;
+  bool closeGrip;
+} DataPacket;
+
+DataPacket incoming;
+
+unsigned long lastUpdate = 0;
+unsigned long smoothTimer = 0;
+unsigned long gripTimer = 0;
+
+void smoothMove(int &angle,int joystickValue,int minA,int maxA)
+{
+  int center = 2048;
+  int deadZone = 250;
+
+  int diff = joystickValue - center;
+
+  if(abs(diff) < deadZone) return;
+
+  int speed = diff / 900;
+
+  angle += speed;
+  angle = constrain(angle,minA,maxA);
+}
+
+void smoothServo(int &current,int target,Servo &servo)
+{
+  if(current < target) current++;
+  else if(current > target) current--;
+
+  servo.write(current);
+}
+
+void OnDataRecv(const esp_now_recv_info *info,const uint8_t *data,int len)
+{
+  memcpy(&incoming,data,sizeof(incoming));
+}
+
+void setup()
+{
+  WiFi.mode(WIFI_STA);
+  esp_now_init();
+  esp_now_register_recv_cb(OnDataRecv);
+
+  baseServo.attach(13);
+  shoulderServo.attach(12);
+  elbowServo.attach(14);
+  wristServo.attach(27);
+  rotateServo.attach(26);
+  gripperServo.attach(25);
+}
+
+void loop()
+{
+
+  if(millis() - lastUpdate > 30)
+  {
+    smoothMove(baseAngle,incoming.j1x,0,180);
+    smoothMove(shoulderAngle,incoming.j1y,0,100);
+    smoothMove(elbowAngle,incoming.j2y,0,120);
+    smoothMove(wristAngle,incoming.j2x,0,180);
+
+    if(incoming.rotCW) rotateAngle += 1;
+    if(incoming.rotCCW) rotateAngle -= 1;
+
+    rotateAngle = constrain(rotateAngle,0,180);
+
+    lastUpdate = millis();
+  }
+
+  // Smooth servo motion
+  if(millis() - smoothTimer > 15)
+  {
+    smoothServo(baseCurrent,baseAngle,baseServo);
+    smoothServo(shoulderCurrent,shoulderAngle,shoulderServo);
+    smoothServo(elbowCurrent,elbowAngle,elbowServo);
+    smoothServo(wristCurrent,wristAngle,wristServo);
+    smoothServo(rotateCurrent,rotateAngle,rotateServo);
+
+    smoothTimer = millis();
+  }
+
+  // Slow gripper
+  if(millis() - gripTimer > 40)
+  {
+    if(incoming.closeGrip && gripperAngle < 90)
+      gripperAngle++;
+
+    if(incoming.openGrip && gripperAngle > 0)
+      gripperAngle--;
+
+    gripperServo.write(gripperAngle);
+
+    gripTimer = millis();
+  }
+}
