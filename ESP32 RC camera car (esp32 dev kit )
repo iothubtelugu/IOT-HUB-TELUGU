@@ -1,0 +1,587 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_wifi.h>
+
+// =====================================================
+// ESP32 DevKit WiFi Hotspot Details
+// =====================================================
+const char* ssid = "ESP32-RC-CAR";
+const char* password = "12345678";
+
+#define WIFI_CHANNEL 6
+
+// Fixed AP MAC address for ESP32 DevKit
+// ESP32-CAM connects to this exact MAC address
+uint8_t DEVKIT_AP_MAC[] = {0x02, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5};
+
+// Custom IP network
+IPAddress AP_IP(192, 168, 10, 1);
+IPAddress AP_GATEWAY(192, 168, 10, 1);
+IPAddress AP_SUBNET(255, 255, 255, 0);
+
+// ESP32-CAM fixed stream and flash URLs
+const char* camStreamURL = "http://192.168.10.200/stream";
+const char* camFlashURL = "http://192.168.10.200/flash";
+
+// =====================================================
+// L298N Motor Driver Pins
+// =====================================================
+#define LEFT_EN     25
+#define LEFT_IN1    26
+#define LEFT_IN2    27
+
+#define RIGHT_EN    33
+#define RIGHT_IN1   18
+#define RIGHT_IN2   19
+
+// =====================================================
+// PWM Settings for ESP32 Arduino Core 3.x
+// =====================================================
+const int PWM_FREQ = 1000;
+const int PWM_RESOLUTION = 8;
+
+// =====================================================
+// Web Server
+// =====================================================
+WebServer server(80);
+
+// Safety stop
+unsigned long lastCommandTime = 0;
+const unsigned long COMMAND_TIMEOUT = 700;
+
+// =====================================================
+// PWM Functions
+// =====================================================
+void setupPWM() {
+  ledcAttach(LEFT_EN, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(RIGHT_EN, PWM_FREQ, PWM_RESOLUTION);
+}
+
+void writePWMValue(int pin, int value) {
+  value = constrain(value, 0, 255);
+  ledcWrite(pin, value);
+}
+
+// =====================================================
+// Motor Functions
+// =====================================================
+void setLeftMotor(int speedValue) {
+  speedValue = constrain(speedValue, -255, 255);
+
+  if (speedValue > 0) {
+    digitalWrite(LEFT_IN1, HIGH);
+    digitalWrite(LEFT_IN2, LOW);
+    writePWMValue(LEFT_EN, speedValue);
+  } 
+  else if (speedValue < 0) {
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, HIGH);
+    writePWMValue(LEFT_EN, -speedValue);
+  } 
+  else {
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, LOW);
+    writePWMValue(LEFT_EN, 0);
+  }
+}
+
+void setRightMotor(int speedValue) {
+  speedValue = constrain(speedValue, -255, 255);
+
+  if (speedValue > 0) {
+    digitalWrite(RIGHT_IN1, HIGH);
+    digitalWrite(RIGHT_IN2, LOW);
+    writePWMValue(RIGHT_EN, speedValue);
+  } 
+  else if (speedValue < 0) {
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, HIGH);
+    writePWMValue(RIGHT_EN, -speedValue);
+  } 
+  else {
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, LOW);
+    writePWMValue(RIGHT_EN, 0);
+  }
+}
+
+void stopCar() {
+  setLeftMotor(0);
+  setRightMotor(0);
+}
+
+void moveCar(String moveCommand, int speedValue) {
+  speedValue = constrain(speedValue, 0, 255);
+
+  int turnSpeed = (speedValue * 85) / 100;
+  int slowSpeed = (speedValue * 45) / 100;
+
+  if (moveCommand == "F") {
+    setLeftMotor(speedValue);
+    setRightMotor(speedValue);
+  } 
+  else if (moveCommand == "B") {
+    setLeftMotor(-speedValue);
+    setRightMotor(-speedValue);
+  } 
+  else if (moveCommand == "L") {
+    setLeftMotor(-turnSpeed);
+    setRightMotor(turnSpeed);
+  } 
+  else if (moveCommand == "R") {
+    setLeftMotor(turnSpeed);
+    setRightMotor(-turnSpeed);
+  } 
+  else if (moveCommand == "FL") {
+    setLeftMotor(slowSpeed);
+    setRightMotor(speedValue);
+  } 
+  else if (moveCommand == "FR") {
+    setLeftMotor(speedValue);
+    setRightMotor(slowSpeed);
+  } 
+  else if (moveCommand == "BL") {
+    setLeftMotor(-slowSpeed);
+    setRightMotor(-speedValue);
+  } 
+  else if (moveCommand == "BR") {
+    setLeftMotor(-speedValue);
+    setRightMotor(-slowSpeed);
+  } 
+  else {
+    stopCar();
+  }
+}
+
+// =====================================================
+// Webpage
+// =====================================================
+String getWebPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32 RC Camera Car</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+  <style>
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+
+    body {
+      margin: 0;
+      background: linear-gradient(135deg, #020617, #0f172a);
+      color: white;
+      font-family: Arial, sans-serif;
+      text-align: center;
+      overflow-x: hidden;
+    }
+
+    .app {
+      width: 100%;
+      min-height: 100vh;
+      padding: 10px;
+    }
+
+    .title {
+      font-size: 23px;
+      font-weight: bold;
+      color: #38bdf8;
+      margin: 8px 0 10px;
+      letter-spacing: 0.5px;
+    }
+
+    .video-box {
+      width: 100%;
+      max-width: 760px;
+      margin: 0 auto;
+      background: #000;
+      border: 2px solid #38bdf8;
+      border-radius: 15px;
+      overflow: hidden;
+      box-shadow: 0 0 25px rgba(56,189,248,0.25);
+    }
+
+    .video-box img {
+      width: 100%;
+      display: block;
+      background: #000;
+    }
+
+    .status {
+      margin: 8px auto;
+      color: #22c55e;
+      font-size: 13px;
+      min-height: 18px;
+    }
+
+    .panel {
+      width: 100%;
+      max-width: 430px;
+      margin: 12px auto;
+      background: rgba(15, 23, 42, 0.95);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      padding: 13px;
+      border-radius: 16px;
+      box-shadow: 0 0 18px rgba(15, 23, 42, 0.4);
+    }
+
+    .panel label {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      color: #cbd5e1;
+      font-size: 14px;
+    }
+
+    .value {
+      color: #38bdf8;
+      font-weight: bold;
+    }
+
+    input[type=range] {
+      width: 100%;
+      accent-color: #38bdf8;
+    }
+
+    .controls {
+      width: 100%;
+      max-width: 430px;
+      margin: 12px auto 0;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 9px;
+    }
+
+    button {
+      height: 62px;
+      border: none;
+      border-radius: 16px;
+      background: #1e293b;
+      color: white;
+      font-size: 15px;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+      box-shadow: 0 5px 0 #0f172a;
+    }
+
+    button:active {
+      transform: translateY(4px);
+      box-shadow: 0 1px 0 #0f172a;
+      background: #38bdf8;
+      color: #020617;
+    }
+
+    .stop {
+      background: #dc2626;
+      color: white;
+    }
+
+    .stop:active {
+      background: #ef4444;
+      color: white;
+    }
+
+    .empty {
+      visibility: hidden;
+    }
+
+    .small {
+      color: #94a3b8;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="app">
+    <div class="title">ESP32 RC Camera Car</div>
+
+    <div class="video-box">
+      <img id="cam" src=")rawliteral";
+
+  html += camStreamURL;
+
+  html += R"rawliteral(" onerror="cameraError()">
+    </div>
+
+    <div class="status" id="status">Controller Ready</div>
+
+    <div class="panel">
+      <label>
+        <span>Motor Speed</span>
+        <span class="value" id="speedValue">180</span>
+      </label>
+      <input id="speed" type="range" min="80" max="255" value="180">
+    </div>
+
+    <div class="panel">
+      <label>
+        <span>Camera Light Intensity</span>
+        <span class="value" id="lightValue">0</span>
+      </label>
+      <input id="light" type="range" min="0" max="255" value="0">
+    </div>
+
+    <div class="controls">
+      <button class="empty">EMPTY</button>
+      <button data-move="F">FORWARD</button>
+      <button class="empty">EMPTY</button>
+
+      <button data-move="L">LEFT</button>
+      <button class="stop" data-move="S">STOP</button>
+      <button data-move="R">RIGHT</button>
+
+      <button class="empty">EMPTY</button>
+      <button data-move="B">BACK</button>
+      <button class="empty">EMPTY</button>
+    </div>
+
+    <div class="small">
+      DevKit: 192.168.10.1 | Camera: 192.168.10.200
+    </div>
+  </div>
+
+  <script>
+    const speedSlider = document.getElementById("speed");
+    const speedValue = document.getElementById("speedValue");
+
+    const lightSlider = document.getElementById("light");
+    const lightValue = document.getElementById("lightValue");
+
+    const statusBox = document.getElementById("status");
+    const cam = document.getElementById("cam");
+
+    let commandTimer = null;
+    let lightTimer = null;
+
+    speedSlider.addEventListener("input", () => {
+      speedValue.innerText = speedSlider.value;
+    });
+
+    lightSlider.addEventListener("input", () => {
+      lightValue.innerText = lightSlider.value;
+
+      if (lightTimer) {
+        clearTimeout(lightTimer);
+      }
+
+      lightTimer = setTimeout(() => {
+        sendLight(lightSlider.value);
+      }, 60);
+    });
+
+    function sendCommand(move) {
+      const speed = speedSlider.value;
+
+      fetch(`/cmd?move=${move}&speed=${speed}`, { cache: "no-store" })
+        .then(() => {
+          statusBox.innerText = "Command: " + move + " | Speed: " + speed;
+          statusBox.style.color = "#22c55e";
+        })
+        .catch(() => {
+          statusBox.innerText = "Controller command error";
+          statusBox.style.color = "#ef4444";
+        });
+    }
+
+    function sendLight(value) {
+      fetch(`http://192.168.10.200/flash?value=${value}`, { cache: "no-store" })
+        .then(() => {
+          statusBox.innerText = "Camera Light: " + value;
+          statusBox.style.color = "#38bdf8";
+        })
+        .catch(() => {
+          statusBox.innerText = "Camera light control error";
+          statusBox.style.color = "#ef4444";
+        });
+    }
+
+    function startMove(move) {
+      sendCommand(move);
+
+      if (commandTimer) {
+        clearInterval(commandTimer);
+      }
+
+      commandTimer = setInterval(() => {
+        sendCommand(move);
+      }, 220);
+    }
+
+    function stopMove() {
+      if (commandTimer) {
+        clearInterval(commandTimer);
+        commandTimer = null;
+      }
+
+      sendCommand("S");
+    }
+
+    document.querySelectorAll("button[data-move]").forEach(btn => {
+      const move = btn.getAttribute("data-move");
+
+      btn.addEventListener("pointerdown", e => {
+        e.preventDefault();
+
+        if (move === "S") {
+          stopMove();
+        } else {
+          startMove(move);
+        }
+      });
+
+      btn.addEventListener("pointerup", e => {
+        e.preventDefault();
+        stopMove();
+      });
+
+      btn.addEventListener("pointerleave", e => {
+        e.preventDefault();
+        stopMove();
+      });
+
+      btn.addEventListener("touchcancel", e => {
+        e.preventDefault();
+        stopMove();
+      });
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        stopMove();
+      }
+    });
+
+    window.addEventListener("beforeunload", () => {
+      navigator.sendBeacon("/cmd?move=S&speed=0");
+    });
+
+    function cameraError() {
+      statusBox.innerText = "Camera not found. Check ESP32-CAM power.";
+      statusBox.style.color = "#ef4444";
+
+      setTimeout(() => {
+        cam.src = "http://192.168.10.200/stream?t=" + Date.now();
+      }, 1500);
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  return html;
+}
+
+// =====================================================
+// Web Handlers
+// =====================================================
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", getWebPage());
+}
+
+void handleCommand() {
+  String moveCommand = "S";
+  int speedValue = 180;
+
+  if (server.hasArg("move")) {
+    moveCommand = server.arg("move");
+  }
+
+  if (server.hasArg("speed")) {
+    speedValue = server.arg("speed").toInt();
+  }
+
+  speedValue = constrain(speedValue, 0, 255);
+
+  moveCar(moveCommand, speedValue);
+  lastCommandTime = millis();
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "Not Found");
+}
+
+// =====================================================
+// WiFi Setup
+// =====================================================
+void setupWiFi() {
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  esp_wifi_set_mac(WIFI_IF_AP, DEVKIT_AP_MAC);
+
+  WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+
+  bool result = WiFi.softAP(ssid, password, WIFI_CHANNEL, 0, 4);
+
+  if (!result) {
+    Serial.println("WiFi AP start failed");
+  }
+
+  Serial.println();
+  Serial.println("====================================");
+  Serial.println("ESP32 DEVKIT CONTROLLER STARTED");
+  Serial.println("====================================");
+  Serial.print("WiFi Name: ");
+  Serial.println(ssid);
+  Serial.print("Password: ");
+  Serial.println(password);
+  Serial.print("DevKit IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("DevKit Fixed AP MAC: ");
+  Serial.println(WiFi.softAPmacAddress());
+  Serial.print("Camera Stream URL: ");
+  Serial.println(camStreamURL);
+  Serial.println("Open on mobile: http://192.168.10.1");
+  Serial.println("====================================");
+}
+
+// =====================================================
+// Setup
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
+
+  setupPWM();
+  stopCar();
+
+  setupWiFi();
+
+  server.on("/", handleRoot);
+  server.on("/cmd", handleCommand);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  lastCommandTime = millis();
+
+  Serial.println("Web server started");
+}
+
+// =====================================================
+// Loop
+// =====================================================
+void loop() {
+  server.handleClient();
+
+  if (millis() - lastCommandTime > COMMAND_TIMEOUT) {
+    stopCar();
+  }
+}
