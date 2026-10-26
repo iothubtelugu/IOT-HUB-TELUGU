@@ -1,0 +1,1173 @@
+/*
+  =============================================================================
+  17-DOF Humanoid Robot - Complete Master Web Controller
+  =============================================================================
+  - Wi-Fi Hotspot: "Humanoid-17DOF" (Password: "12345678")
+  - Web Dashboard: http://192.168.4.1 (or http://humanoid.local)
+  - 6-Phase Bipedal Walking Gait with Interactive Web D-Pad
+  - Real-Time Gait Tuning Sliders (Lean, Stride, Lift, Speed)
+  - 17 Live Joint Sliders with Angle Readouts
+  - Live Balance Trim Calibration (±10°)
+  - Smooth S-Curve Trajectory Engine & Emergency Torque Cut
+  =============================================================================
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <ESP32Servo.h>
+
+const char* AP_SSID = "Humanoid-17DOF";
+const char* AP_PASS = "12345678";
+
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define HEAD_PIN 18
+#define PCA9685_ADDR 0x40
+
+#define SERVOMIN_TICKS 102   // 500 us (0 deg)
+#define SERVOMAX_TICKS 512   // 2500 us (180 deg)
+
+Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(PCA9685_ADDR);
+Servo headServo;
+WebServer server(80);
+
+enum JointIndex {
+  J_HEAD = 0,
+  J_RE, J_RHK, J_RP,              // Right Arm (Ch 0, 1, 2)
+  J_LE, J_LHK, J_LP,              // Left Arm  (Ch 3, 4, 5)
+  J_RHT, J_RH, J_RK, J_RA, J_RAT, // Right Leg (Ch 6, 7, 8, 9, 10)
+  J_LHT, J_LH, J_LK, J_LA, J_LAT  // Left Leg  (Ch 11, 12, 13, 14, 15)
+};
+
+const char* jointCodes[17] = {
+  "HEAD",
+  "RE", "RHK", "RP",
+  "LE", "LHK", "LP",
+  "RHT", "RH", "RK", "RA", "RAT",
+  "LHT", "LH", "LK", "LA", "LAT"
+};
+
+const int jointChannels[17] = {
+  -1,          // HEAD -> Direct GPIO 18
+  0, 1, 2,     // Right Arm
+  3, 4, 5,     // Left Arm
+  6, 7, 8, 9, 10,   // Right Leg
+  11, 12, 13, 14, 15 // Left Leg
+};
+
+// ============================================================================
+// CALIBRATION TRIMS & INITIAL POSES
+// ============================================================================
+int trims[17] = {0};
+float currentAngles[17];
+bool torqueEnabled = true;
+
+// Reference Neutral Standing Pose
+const int POSE_STAND[17] = {
+  90,            // HEAD
+  30,  30,  30,  // RE, RHK, RP
+  150, 150, 150, // LE, LHK, LP
+  90,  30,  30, 150, 90,  // RHT, RH, RK, RA, RAT
+  90, 150, 150,  30, 90   // LHT, LH, LK, LA, LAT
+};
+
+const int POSE_SQUAT[17] = {
+  90,
+  30,  30,  30,
+  150, 150, 150,
+  90,  55,  65, 125, 90,
+  90, 125, 115,  55, 90
+};
+
+const int POSE_BOW[17] = {
+  90,
+  30,  45,  30,
+  150, 135, 150,
+  90,  60,  30, 150, 90,
+  90, 120, 150,  30, 90
+};
+
+// ============================================================================
+// WALKING GAIT PARAMETERS & STATE MACHINE
+// ============================================================================
+int LEAN_ANGLE  = 12;   // Ankle roll tilt (degrees)
+int STEP_LENGTH = 16;   // Hip forward swing (degrees)
+int LIFT_HEIGHT = 20;   // Knee lift clearance (degrees)
+int STEP_SPEED  = 280;  // ms per phase
+int TURN_ANGLE  = 14;   // Hip turn angle (degrees)
+
+enum WalkMode {
+  WALK_STOP = 0,
+  WALK_FWD,
+  WALK_BWD,
+  WALK_LEFT,
+  WALK_RIGHT
+};
+
+WalkMode activeWalkMode = WALK_STOP;
+int gaitPhase = 0;
+bool stopGaitRequested = false;
+
+// ============================================================================
+// MOTION INTERPOLATION ENGINE (S-Curve Cosine Ease)
+// ============================================================================
+bool isMoving = false;
+unsigned long moveStartTime = 0;
+int moveDuration = 300;
+float startAngles[17];
+float targetAngles[17];
+
+struct MotionStep {
+  int pose[17];
+  int duration;
+  int pauseAfter;
+};
+
+#define MAX_QUEUE_STEPS 8
+MotionStep sequenceQueue[MAX_QUEUE_STEPS];
+int sequenceLength = 0;
+int currentStepIndex = -1;
+unsigned long pauseUntil = 0;
+
+int degreesToTicks(int angle) {
+  angle = constrain(angle, 0, 180);
+  return map(angle, 0, 180, SERVOMIN_TICKS, SERVOMAX_TICKS);
+}
+
+void writeJointHardware(int index, float rawAngle) {
+  if (!torqueEnabled) return;
+  int finalAngle = constrain((int)round(rawAngle + trims[index]), 0, 180);
+
+  if (jointChannels[index] >= 0) {
+    pca.setPWM(jointChannels[index], 0, degreesToTicks(finalAngle));
+  } else {
+    if (!headServo.attached()) headServo.attach(HEAD_PIN, 500, 2500);
+    headServo.write(finalAngle);
+  }
+}
+
+void startMoveTo(const int targetPose[17], int durationMs) {
+  torqueEnabled = true;
+  for (int i = 0; i < 17; i++) {
+    startAngles[i] = currentAngles[i];
+    targetAngles[i] = targetPose[i];
+  }
+  moveDuration = max(40, durationMs);
+  moveStartTime = millis();
+  isMoving = true;
+}
+
+void resetSequence() {
+  sequenceLength = 0;
+  currentStepIndex = -1;
+  pauseUntil = 0;
+}
+
+void queueStep(const int targetPose[17], int duration, int pauseAfter = 0) {
+  if (sequenceLength < MAX_QUEUE_STEPS) {
+    memcpy(sequenceQueue[sequenceLength].pose, targetPose, sizeof(int) * 17);
+    sequenceQueue[sequenceLength].duration = duration;
+    sequenceQueue[sequenceLength].pauseAfter = pauseAfter;
+    sequenceLength++;
+  }
+}
+
+void startQueuedSequence() {
+  if (sequenceLength > 0) {
+    currentStepIndex = 0;
+    pauseUntil = 0;
+    startMoveTo(sequenceQueue[0].pose, sequenceQueue[0].duration);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Gait Calculation Functions
+// ----------------------------------------------------------------------------
+void buildWalkPose(int poseOut[17], int phase, int direction) {
+  memcpy(poseOut, POSE_STAND, sizeof(int) * 17);
+  int step = STEP_LENGTH * direction;
+  int lean = LEAN_ANGLE;
+  int lift = LIFT_HEIGHT;
+
+  switch (phase) {
+    case 0: // Shift weight Left
+      poseOut[J_RAT] = 90 - lean;
+      poseOut[J_LAT] = 90 - lean;
+      poseOut[J_RHK] = 30 - 5;
+      poseOut[J_LHK] = 150 - 5;
+      break;
+
+    case 1: // Swing Right Leg Forward
+      poseOut[J_RAT] = 90 - lean;
+      poseOut[J_LAT] = 90 - lean;
+      poseOut[J_RH]  = 30 + step;
+      poseOut[J_RK]  = 30 + lift;
+      poseOut[J_RA]  = 150 - step - (lift / 2);
+      poseOut[J_RHK] = 30 - 15;
+      poseOut[J_LHK] = 150 - 15;
+      break;
+
+    case 2: // Right Foot Touchdown (Double Support)
+      poseOut[J_RAT] = 90;
+      poseOut[J_LAT] = 90;
+      poseOut[J_RH]  = 30 + (step / 2);
+      poseOut[J_RK]  = 30;
+      poseOut[J_RA]  = 150 - (step / 2);
+      poseOut[J_LH]  = 150 + (step / 2);
+      poseOut[J_LA]  = 30 - (step / 2);
+      break;
+
+    case 3: // Shift weight Right
+      poseOut[J_RAT] = 90 + lean;
+      poseOut[J_LAT] = 90 + lean;
+      poseOut[J_RHK] = 30 + 5;
+      poseOut[J_LHK] = 150 + 5;
+      break;
+
+    case 4: // Swing Left Leg Forward
+      poseOut[J_RAT] = 90 + lean;
+      poseOut[J_LAT] = 90 + lean;
+      poseOut[J_LH]  = 150 - step;
+      poseOut[J_LK]  = 150 - lift;
+      poseOut[J_LA]  = 30 + step + (lift / 2);
+      poseOut[J_RHK] = 30 + 15;
+      poseOut[J_LHK] = 150 + 15;
+      break;
+
+    case 5: // Left Foot Touchdown (Double Support)
+      poseOut[J_RAT] = 90;
+      poseOut[J_LAT] = 90;
+      poseOut[J_LH]  = 150 - (step / 2);
+      poseOut[J_LK]  = 150;
+      poseOut[J_LA]  = 30 + (step / 2);
+      poseOut[J_RH]  = 30 - (step / 2);
+      poseOut[J_RA]  = 150 + (step / 2);
+      break;
+  }
+}
+
+void buildTurnPose(int poseOut[17], int phase, int turnDir) {
+  memcpy(poseOut, POSE_STAND, sizeof(int) * 17);
+  int lean = LEAN_ANGLE;
+  int turn = TURN_ANGLE * turnDir;
+
+  switch (phase) {
+    case 0: // Shift weight Left
+      poseOut[J_RAT] = 90 - lean;
+      poseOut[J_LAT] = 90 - lean;
+      break;
+    case 1: // Rotate Right airborne leg
+      poseOut[J_RAT] = 90 - lean;
+      poseOut[J_LAT] = 90 - lean;
+      poseOut[J_RHT] = 90 + turn;
+      poseOut[J_RK]  = 30 + LIFT_HEIGHT;
+      break;
+    case 2: // Right Foot touchdown
+      poseOut[J_RAT] = 90;
+      poseOut[J_LAT] = 90;
+      poseOut[J_RHT] = 90 + turn;
+      break;
+    case 3: // Shift weight Right
+      poseOut[J_RAT] = 90 + lean;
+      poseOut[J_LAT] = 90 + lean;
+      break;
+    case 4: // Rotate Left leg to re-align
+      poseOut[J_RAT] = 90 + lean;
+      poseOut[J_LAT] = 90 + lean;
+      poseOut[J_LHT] = 90 + turn;
+      poseOut[J_LK]  = 150 - LIFT_HEIGHT;
+      break;
+    case 5: // Touchdown aligned
+      poseOut[J_RAT] = 90;
+      poseOut[J_LAT] = 90;
+      poseOut[J_RHT] = 90;
+      poseOut[J_LHT] = 90;
+      break;
+  }
+}
+
+void stepWalkingGait() {
+  if (activeWalkMode == WALK_STOP) return;
+
+  if (stopGaitRequested) {
+    if (gaitPhase == 2 || gaitPhase == 5) {
+      activeWalkMode = WALK_STOP;
+      stopGaitRequested = false;
+      gaitPhase = 0;
+      startMoveTo(POSE_STAND, 400);
+      return;
+    }
+  }
+
+  int targetPose[17];
+  if (activeWalkMode == WALK_FWD) {
+    buildWalkPose(targetPose, gaitPhase, +1);
+    startMoveTo(targetPose, STEP_SPEED);
+  } else if (activeWalkMode == WALK_BWD) {
+    buildWalkPose(targetPose, gaitPhase, -1);
+    startMoveTo(targetPose, STEP_SPEED);
+  } else if (activeWalkMode == WALK_LEFT) {
+    buildTurnPose(targetPose, gaitPhase, +1);
+    startMoveTo(targetPose, STEP_SPEED);
+  } else if (activeWalkMode == WALK_RIGHT) {
+    buildTurnPose(targetPose, gaitPhase, -1);
+    startMoveTo(targetPose, STEP_SPEED);
+  }
+
+  gaitPhase = (gaitPhase + 1) % 6;
+}
+
+void updateMotionEngine() {
+  unsigned long now = millis();
+
+  if (pauseUntil > 0) {
+    if (now >= pauseUntil) {
+      pauseUntil = 0;
+      currentStepIndex++;
+      if (currentStepIndex < sequenceLength) {
+        startMoveTo(sequenceQueue[currentStepIndex].pose, sequenceQueue[currentStepIndex].duration);
+      } else {
+        resetSequence();
+      }
+    }
+    return;
+  }
+
+  if (!isMoving) {
+    if (activeWalkMode != WALK_STOP) {
+      stepWalkingGait();
+    }
+    return;
+  }
+
+  unsigned long elapsed = now - moveStartTime;
+  if (elapsed >= (unsigned long)moveDuration) {
+    for (int i = 0; i < 17; i++) {
+      currentAngles[i] = targetAngles[i];
+      writeJointHardware(i, currentAngles[i]);
+    }
+    isMoving = false;
+
+    if (currentStepIndex >= 0 && currentStepIndex < sequenceLength) {
+      if (sequenceQueue[currentStepIndex].pauseAfter > 0) {
+        pauseUntil = now + sequenceQueue[currentStepIndex].pauseAfter;
+      } else {
+        currentStepIndex++;
+        if (currentStepIndex < sequenceLength) {
+          startMoveTo(sequenceQueue[currentStepIndex].pose, sequenceQueue[currentStepIndex].duration);
+        } else {
+          resetSequence();
+        }
+      }
+    }
+  } else {
+    float t = (float)elapsed / (float)moveDuration;
+    float factor = 0.5f * (1.0f - cos(t * 3.14159265f));
+
+    for (int i = 0; i < 17; i++) {
+      float interpolated = startAngles[i] + (targetAngles[i] - startAngles[i]) * factor;
+      currentAngles[i] = interpolated;
+      writeJointHardware(i, interpolated);
+    }
+  }
+}
+
+void triggerWaveSequence() {
+  int pWave1[17], pWave2[17];
+  memcpy(pWave1, POSE_STAND, sizeof(pWave1));
+  memcpy(pWave2, POSE_STAND, sizeof(pWave2));
+
+  pWave1[J_RHK] = 120; pWave1[J_RP] = 90; pWave1[J_RE] = 15;
+  pWave2[J_RHK] = 120; pWave2[J_RP] = 90; pWave2[J_RE] = 65;
+
+  resetSequence();
+  queueStep(pWave1, 600, 50);
+  queueStep(pWave2, 250, 30);
+  queueStep(pWave1, 250, 30);
+  queueStep(pWave2, 250, 30);
+  queueStep(POSE_STAND, 600, 0);
+  startQueuedSequence();
+}
+
+void triggerBowSequence() {
+  resetSequence();
+  queueStep(POSE_BOW, 700, 600);
+  queueStep(POSE_STAND, 700, 0);
+  startQueuedSequence();
+}
+
+void releaseServos() {
+  activeWalkMode = WALK_STOP;
+  isMoving = false;
+  resetSequence();
+  torqueEnabled = false;
+  for (int ch = 0; ch < 16; ch++) {
+    pca.setPWM(ch, 0, 0);
+  }
+  headServo.detach();
+  Serial.println("[TORQUE] Servos released.");
+}
+
+// ============================================================================
+// EMBEDDED WEB DASHBOARD HTML / CSS / JS
+// ============================================================================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>17-DOF Humanoid Controller</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: #121926;
+      --card-border: #1e293b;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --cyan: #06b6d4;
+      --cyan-glow: rgba(6, 182, 212, 0.25);
+      --red: #f43f5e;
+      --green: #10b981;
+      --font-stack: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: var(--font-stack);
+      padding: env(safe-area-inset-top, 12px) 16px env(safe-area-inset-bottom, 20px);
+      min-block-size: 100dvh;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.75rem;
+      padding-block-end: 0.75rem;
+      border-block-end: 1px solid var(--card-border);
+    }
+    .title-group { display: flex; align-items: center; gap: 0.6rem; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--green);
+      padding: 0.25rem 0.6rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .btn-estop {
+      background: var(--red);
+      color: white;
+      border: none;
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 0.85rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      box-shadow: 0 0 12px rgba(244, 63, 94, 0.4);
+      touch-action: manipulation;
+    }
+    .btn-estop:active { transform: scale(0.96); opacity: 0.9; }
+
+    /* Nav Tabs */
+    .nav-tabs {
+      display: flex;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 4px;
+      gap: 4px;
+    }
+    .tab-btn {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 0.6rem 0.4rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      touch-action: manipulation;
+    }
+    .tab-btn.active {
+      background: var(--cyan);
+      color: #04101c;
+      box-shadow: 0 0 10px var(--cyan-glow);
+    }
+
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* D-PAD WALKING CONTROLS */
+    .dpad-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 1.5rem;
+      padding: 1rem 0;
+    }
+    .dpad {
+      display: grid;
+      grid-template-columns: repeat(3, 72px);
+      grid-template-rows: repeat(3, 72px);
+      gap: 8px;
+      place-items: center;
+    }
+    .dpad-btn {
+      width: 100%;
+      height: 100%;
+      background: var(--card-bg);
+      border: 2px solid var(--card-border);
+      border-radius: 14px;
+      color: var(--text);
+      font-size: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      touch-action: manipulation;
+      transition: all 0.15s ease;
+    }
+    .dpad-btn:active {
+      background: var(--cyan);
+      color: #04101c;
+      border-color: var(--cyan);
+      transform: scale(0.94);
+    }
+    .dpad-btn.stop-btn {
+      background: rgba(244, 63, 94, 0.15);
+      border-color: var(--red);
+      color: var(--red);
+      font-size: 1.2rem;
+    }
+    .dpad-btn.stop-btn:active { background: var(--red); color: white; }
+
+    /* Sliders & Sections */
+    .section-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1rem;
+      margin-block-end: 1rem;
+    }
+    .section-header {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--cyan);
+      margin-block-end: 0.85rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .joint-row {
+      display: grid;
+      grid-template-columns: 80px 1fr 45px;
+      align-items: center;
+      gap: 0.75rem;
+      margin-block-end: 0.65rem;
+    }
+    .joint-code { font-size: 0.82rem; font-weight: 600; }
+    .joint-desc { font-size: 0.68rem; color: var(--text-muted); display: block; }
+    .val-badge {
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--cyan);
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    input[type=range] {
+      inline-size: 100%;
+      height: 6px;
+      border-radius: 3px;
+      background: #1e293b;
+      outline: none;
+      accent-color: var(--cyan);
+      touch-action: pan-y;
+    }
+
+    /* Actions Grid */
+    .action-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 0.75rem;
+    }
+    .action-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1rem 0.75rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.5rem;
+      cursor: pointer;
+      transition: transform 0.15s, border-color 0.15s;
+      touch-action: manipulation;
+    }
+    .action-card:active { transform: scale(0.96); border-color: var(--cyan); }
+    .action-icon { font-size: 1.8rem; }
+    .action-label { font-size: 0.9rem; font-weight: 600; }
+    .action-sub { font-size: 0.7rem; color: var(--text-muted); }
+
+    /* Trims */
+    .trim-row {
+      display: grid;
+      grid-template-columns: 100px 1fr 100px;
+      align-items: center;
+      gap: 0.5rem;
+      padding-block: 0.4rem;
+      border-block-end: 1px solid #1a2234;
+    }
+    .trim-btn {
+      background: #1e293b;
+      color: var(--text);
+      border: 1px solid var(--card-border);
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .trim-btn:active { background: var(--cyan); color: #000; }
+    .trim-controls { display: flex; align-items: center; gap: 0.4rem; justify-content: flex-end; }
+    .trim-val { font-size: 0.82rem; font-weight: 600; min-inline-size: 32px; text-align: center; }
+
+    footer {
+      text-align: center;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      margin-block-start: auto;
+      padding-block-start: 1rem;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="title-group">
+      <h2>17-DOF Humanoid</h2>
+      <div class="badge" id="netStatus"><div class="dot"></div> Live AP</div>
+    </div>
+    <button class="btn-estop" onclick="releaseTorque()">🛑 Release Torque</button>
+  </header>
+
+  <div class="nav-tabs">
+    <button class="tab-btn active" onclick="openTab('walk')">🚶 Walk</button>
+    <button class="tab-btn" onclick="openTab('actions')">⚡ Poses</button>
+    <button class="tab-btn" onclick="openTab('sliders')">🎛️ Joints (17)</button>
+    <button class="tab-btn" onclick="openTab('trims')">⚖️ Trims</button>
+  </div>
+
+  <!-- TAB 0: WALKING D-PAD -->
+  <div id="tab-walk" class="tab-panel active">
+    <div class="dpad-container">
+      <div class="dpad">
+        <div></div>
+        <button class="dpad-btn" onclick="sendWalk('forward')">▲</button>
+        <div></div>
+
+        <button class="dpad-btn" onclick="sendWalk('left')">◀</button>
+        <button class="dpad-btn stop-btn" onclick="sendWalk('stop')">⏹</button>
+        <button class="dpad-btn" onclick="sendWalk('right')">▶</button>
+
+        <div></div>
+        <button class="dpad-btn" onclick="sendWalk('backward')">▼</button>
+        <div></div>
+      </div>
+    </div>
+
+    <div class="section-card">
+      <div class="section-header">⚙️ Real-time Gait Tuning</div>
+      
+      <div class="joint-row">
+        <div><span class="joint-code">LEAN</span><span class="joint-desc">Ankle Roll</span></div>
+        <input type="range" id="gait_lean" min="8" max="18" value="12" oninput="onGaitParamChange()">
+        <span class="val-badge" id="val_gait_lean">12°</span>
+      </div>
+
+      <div class="joint-row">
+        <div><span class="joint-code">STEP</span><span class="joint-desc">Hip Swing</span></div>
+        <input type="range" id="gait_step" min="10" max="25" value="16" oninput="onGaitParamChange()">
+        <span class="val-badge" id="val_gait_step">16°</span>
+      </div>
+
+      <div class="joint-row">
+        <div><span class="joint-code">LIFT</span><span class="joint-desc">Knee Height</span></div>
+        <input type="range" id="gait_lift" min="12" max="28" value="20" oninput="onGaitParamChange()">
+        <span class="val-badge" id="val_gait_lift">20°</span>
+      </div>
+
+      <div class="joint-row">
+        <div><span class="joint-code">SPEED</span><span class="joint-desc">ms / phase</span></div>
+        <input type="range" id="gait_speed" min="200" max="450" value="280" oninput="onGaitParamChange()">
+        <span class="val-badge" id="val_gait_speed">280ms</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 1: ACTIONS -->
+  <div id="tab-actions" class="tab-panel">
+    <div class="action-grid">
+      <div class="action-card" onclick="sendPose('stand')">
+        <span class="action-icon">🧍</span>
+        <span class="action-label">Stand Up</span>
+        <span class="action-sub">Neutral Balance</span>
+      </div>
+      <div class="action-card" onclick="sendPose('squat')">
+        <span class="action-icon">🧎</span>
+        <span class="action-label">Squat</span>
+        <span class="action-sub">Lower Center Mass</span>
+      </div>
+      <div class="action-card" onclick="sendPose('bow')">
+        <span class="action-icon">🙇</span>
+        <span class="action-label">Bow</span>
+        <span class="action-sub">Polite Greeting</span>
+      </div>
+      <div class="action-card" onclick="sendPose('wave')">
+        <span class="action-icon">👋</span>
+        <span class="action-label">Wave Hand</span>
+        <span class="action-sub">Right Arm Cycle</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 2: LIVE SLIDERS -->
+  <div id="tab-sliders" class="tab-panel">
+    
+    <div class="section-card">
+      <div class="section-header">👤 Head / Neck (Direct GPIO 18)</div>
+      <div class="joint-row">
+        <div><span class="joint-code">HEAD</span><span class="joint-desc">Pan</span></div>
+        <input type="range" id="slider_HEAD" min="0" max="180" value="90" oninput="onSliderDrag('HEAD', this.value)">
+        <span class="val-badge" id="val_HEAD">90°</span>
+      </div>
+    </div>
+
+    <div class="section-card">
+      <div class="section-header">💪 Right Arm (PCA9685 Ch 0-2)</div>
+      <div class="joint-row">
+        <div><span class="joint-code">RE</span><span class="joint-desc">Shoulder Ext</span></div>
+        <input type="range" id="slider_RE" min="0" max="180" value="30" oninput="onSliderDrag('RE', this.value)">
+        <span class="val-badge" id="val_RE">30°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">RHK</span><span class="joint-desc">Shoulder Pitch</span></div>
+        <input type="range" id="slider_RHK" min="0" max="180" value="30" oninput="onSliderDrag('RHK', this.value)">
+        <span class="val-badge" id="val_RHK">30°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">RP</span><span class="joint-desc">Elbow Flex</span></div>
+        <input type="range" id="slider_RP" min="0" max="180" value="30" oninput="onSliderDrag('RP', this.value)">
+        <span class="val-badge" id="val_RP">30°</span>
+      </div>
+    </div>
+
+    <div class="section-card">
+      <div class="section-header">💪 Left Arm (PCA9685 Ch 3-5)</div>
+      <div class="joint-row">
+        <div><span class="joint-code">LE</span><span class="joint-desc">Shoulder Ext</span></div>
+        <input type="range" id="slider_LE" min="0" max="180" value="150" oninput="onSliderDrag('LE', this.value)">
+        <span class="val-badge" id="val_LE">150°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">LHK</span><span class="joint-desc">Shoulder Pitch</span></div>
+        <input type="range" id="slider_LHK" min="0" max="180" value="150" oninput="onSliderDrag('LHK', this.value)">
+        <span class="val-badge" id="val_LHK">150°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">LP</span><span class="joint-desc">Elbow Flex</span></div>
+        <input type="range" id="slider_LP" min="0" max="180" value="150" oninput="onSliderDrag('LP', this.value)">
+        <span class="val-badge" id="val_LP">150°</span>
+      </div>
+    </div>
+
+    <div class="section-card">
+      <div class="section-header">🦵 Right Leg (PCA9685 Ch 6-10)</div>
+      <div class="joint-row">
+        <div><span class="joint-code">RHT</span><span class="joint-desc">Hip Turn</span></div>
+        <input type="range" id="slider_RHT" min="0" max="180" value="90" oninput="onSliderDrag('RHT', this.value)">
+        <span class="val-badge" id="val_RHT">90°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">RH</span><span class="joint-desc">Hip Pitch</span></div>
+        <input type="range" id="slider_RH" min="0" max="180" value="30" oninput="onSliderDrag('RH', this.value)">
+        <span class="val-badge" id="val_RH">30°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">RK</span><span class="joint-desc">Knee Pitch</span></div>
+        <input type="range" id="slider_RK" min="0" max="180" value="30" oninput="onSliderDrag('RK', this.value)">
+        <span class="val-badge" id="val_RK">30°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">RA</span><span class="joint-desc">Ankle Pitch</span></div>
+        <input type="range" id="slider_RA" min="0" max="180" value="150" oninput="onSliderDrag('RA', this.value)">
+        <span class="val-badge" id="val_RA">150°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">RAT</span><span class="joint-desc">Ankle Tilt</span></div>
+        <input type="range" id="slider_RAT" min="0" max="180" value="90" oninput="onSliderDrag('RAT', this.value)">
+        <span class="val-badge" id="val_RAT">90°</span>
+      </div>
+    </div>
+
+    <div class="section-card">
+      <div class="section-header">🦵 Left Leg (PCA9685 Ch 11-15)</div>
+      <div class="joint-row">
+        <div><span class="joint-code">LHT</span><span class="joint-desc">Hip Turn</span></div>
+        <input type="range" id="slider_LHT" min="0" max="180" value="90" oninput="onSliderDrag('LHT', this.value)">
+        <span class="val-badge" id="val_LHT">90°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">LH</span><span class="joint-desc">Hip Pitch</span></div>
+        <input type="range" id="slider_LH" min="0" max="180" value="150" oninput="onSliderDrag('LH', this.value)">
+        <span class="val-badge" id="val_LH">150°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">LK</span><span class="joint-desc">Knee Pitch</span></div>
+        <input type="range" id="slider_LK" min="0" max="180" value="150" oninput="onSliderDrag('LK', this.value)">
+        <span class="val-badge" id="val_LK">150°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">LA</span><span class="joint-desc">Ankle Pitch</span></div>
+        <input type="range" id="slider_LA" min="0" max="180" value="30" oninput="onSliderDrag('LA', this.value)">
+        <span class="val-badge" id="val_LA">30°</span>
+      </div>
+      <div class="joint-row">
+        <div><span class="joint-code">LAT</span><span class="joint-desc">Ankle Tilt</span></div>
+        <input type="range" id="slider_LAT" min="0" max="180" value="90" oninput="onSliderDrag('LAT', this.value)">
+        <span class="val-badge" id="val_LAT">90°</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- TAB 3: TRIMS -->
+  <div id="tab-trims" class="tab-panel">
+    <div class="section-card">
+      <div class="section-header">⚖️ Fine Balance Trims (±10°)</div>
+      <p style="font-size:0.75rem; color:var(--text-muted); margin-block-end:0.75rem;">
+        Fine-tune offsets to ensure both feet rest 100% flat on the floor.
+      </p>
+      <div id="trimList"></div>
+    </div>
+  </div>
+
+  <footer>17-DOF Humanoid • Powered by ESP32 & PCA9685</footer>
+
+  <script>
+    const jointList = [
+      {code:"HEAD", name:"Head Pan"},
+      {code:"RE", name:"R Shoulder Ext"}, {code:"RHK", name:"R Shoulder Pitch"}, {code:"RP", name:"R Elbow"},
+      {code:"LE", name:"L Shoulder Ext"}, {code:"LHK", name:"L Shoulder Pitch"}, {code:"LP", name:"L Elbow"},
+      {code:"RHT", name:"R Hip Turn"}, {code:"RH", name:"R Hip Pitch"}, {code:"RK", name:"R Knee"}, {code:"RA", name:"R Ankle Pitch"}, {code:"RAT", name:"R Ankle Tilt"},
+      {code:"LHT", name:"L Hip Turn"}, {code:"LH", name:"L Hip Pitch"}, {code:"LK", name:"L Knee"}, {code:"LA", name:"L Ankle Pitch"}, {code:"LAT", name:"L Ankle Tilt"}
+    ];
+
+    let currentTrims = {};
+    jointList.forEach(j => currentTrims[j.code] = 0);
+
+    function buildTrimList() {
+      const container = document.getElementById('trimList');
+      container.innerHTML = '';
+      jointList.forEach(j => {
+        const row = document.createElement('div');
+        row.className = 'trim-row';
+        row.innerHTML = `
+          <div><span class="joint-code">${j.code}</span><span class="joint-desc">${j.name}</span></div>
+          <div></div>
+          <div class="trim-controls">
+            <button class="trim-btn" onclick="adjustTrim('${j.code}', -1)">-</button>
+            <span class="trim-val" id="trim_${j.code}">0°</span>
+            <button class="trim-btn" onclick="adjustTrim('${j.code}', 1)">+</button>
+          </div>
+        `;
+        container.appendChild(row);
+      });
+    }
+    buildTrimList();
+
+    function openTab(tabId) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      event.currentTarget.classList.add('active');
+      document.getElementById('tab-' + tabId).classList.add('active');
+      if (tabId === 'sliders') syncStatus();
+    }
+
+    function sendWalk(cmd) {
+      fetch('/api/walk?cmd=' + cmd);
+    }
+
+    let gaitTimeout = null;
+    function onGaitParamChange() {
+      const lean = document.getElementById('gait_lean').value;
+      const step = document.getElementById('gait_step').value;
+      const lift = document.getElementById('gait_lift').value;
+      const speed = document.getElementById('gait_speed').value;
+
+      document.getElementById('val_gait_lean').innerText = lean + '°';
+      document.getElementById('val_gait_step').innerText = step + '°';
+      document.getElementById('val_gait_lift').innerText = lift + '°';
+      document.getElementById('val_gait_speed').innerText = speed + 'ms';
+
+      if (gaitTimeout) clearTimeout(gaitTimeout);
+      gaitTimeout = setTimeout(() => {
+        fetch(`/api/gaitparams?lean=${lean}&step=${step}&lift=${lift}&speed=${speed}`);
+      }, 50);
+    }
+
+    function sendPose(name) {
+      fetch('/api/pose?name=' + name);
+    }
+
+    let dragTimeout = null;
+    function onSliderDrag(code, val) {
+      document.getElementById('val_' + code).innerText = val + '°';
+      if (dragTimeout) clearTimeout(dragTimeout);
+      dragTimeout = setTimeout(() => {
+        fetch(`/api/joint?code=${code}&angle=${val}`);
+      }, 30);
+    }
+
+    function adjustTrim(code, delta) {
+      const newVal = (currentTrims[code] || 0) + delta;
+      currentTrims[code] = newVal;
+      document.getElementById('trim_' + code).innerText = (newVal > 0 ? '+' : '') + newVal + '°';
+      fetch(`/api/trim?code=${code}&val=${newVal}`);
+    }
+
+    function releaseTorque() {
+      fetch('/api/release').then(() => alert('Servos Detached (Zero Torque).'));
+    }
+
+    function syncStatus() {
+      fetch('/api/status')
+        .then(r => r.json())
+        .then(data => {
+          if (data.angles) {
+            for (let code in data.angles) {
+              const slider = document.getElementById('slider_' + code);
+              const badge = document.getElementById('val_' + code);
+              if (slider) slider.value = Math.round(data.angles[code]);
+              if (badge) badge.innerText = Math.round(data.angles[code]) + '°';
+            }
+          }
+        })
+        .catch(() => {});
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================================
+// WEB SERVER API HANDLERS
+// ============================================================================
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleWalk() {
+  if (!server.hasArg("cmd")) {
+    server.send(400, "application/json", "{\"error\":\"Missing cmd\"}");
+    return;
+  }
+  String cmd = server.arg("cmd");
+  Serial.printf("[WEB] Walk Command: %s\n", cmd.c_str());
+
+  if (cmd.equalsIgnoreCase("forward")) {
+    activeWalkMode = WALK_FWD;
+    stopGaitRequested = false;
+    gaitPhase = 0;
+  } else if (cmd.equalsIgnoreCase("backward")) {
+    activeWalkMode = WALK_BWD;
+    stopGaitRequested = false;
+    gaitPhase = 0;
+  } else if (cmd.equalsIgnoreCase("left")) {
+    activeWalkMode = WALK_LEFT;
+    stopGaitRequested = false;
+    gaitPhase = 0;
+  } else if (cmd.equalsIgnoreCase("right")) {
+    activeWalkMode = WALK_RIGHT;
+    stopGaitRequested = false;
+    gaitPhase = 0;
+  } else if (cmd.equalsIgnoreCase("stop")) {
+    stopGaitRequested = true;
+  }
+
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handleGaitParams() {
+  if (server.hasArg("lean"))  LEAN_ANGLE  = server.arg("lean").toInt();
+  if (server.hasArg("step"))  STEP_LENGTH = server.arg("step").toInt();
+  if (server.hasArg("lift"))  LIFT_HEIGHT = server.arg("lift").toInt();
+  if (server.hasArg("speed")) STEP_SPEED  = server.arg("speed").toInt();
+
+  Serial.printf("[GAIT] Updated: Lean=%d, Step=%d, Lift=%d, Speed=%d\n", 
+                LEAN_ANGLE, STEP_LENGTH, LIFT_HEIGHT, STEP_SPEED);
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handlePose() {
+  if (!server.hasArg("name")) {
+    server.send(400, "application/json", "{\"error\":\"Missing pose name\"}");
+    return;
+  }
+  String name = server.arg("name");
+  Serial.printf("[WEB] Command Pose: %s\n", name.c_str());
+
+  activeWalkMode = WALK_STOP;
+
+  if (name.equalsIgnoreCase("stand")) {
+    startMoveTo(POSE_STAND, 700);
+  } else if (name.equalsIgnoreCase("squat")) {
+    startMoveTo(POSE_SQUAT, 800);
+  } else if (name.equalsIgnoreCase("bow")) {
+    triggerBowSequence();
+  } else if (name.equalsIgnoreCase("wave")) {
+    triggerWaveSequence();
+  }
+
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handleJoint() {
+  if (!server.hasArg("code") || !server.hasArg("angle")) {
+    server.send(400, "application/json", "{\"error\":\"Missing code or angle\"}");
+    return;
+  }
+  String code = server.arg("code");
+  int angle = server.arg("angle").toInt();
+
+  activeWalkMode = WALK_STOP;
+
+  for (int i = 0; i < 17; i++) {
+    if (code.equalsIgnoreCase(jointCodes[i])) {
+      torqueEnabled = true;
+      currentAngles[i] = angle;
+      writeJointHardware(i, angle);
+      server.send(200, "application/json", "{\"status\":\"ok\"}");
+      return;
+    }
+  }
+  server.send(404, "application/json", "{\"error\":\"Joint not found\"}");
+}
+
+void handleTrim() {
+  if (!server.hasArg("code") || !server.hasArg("val")) {
+    server.send(400, "application/json", "{\"error\":\"Missing code or val\"}");
+    return;
+  }
+  String code = server.arg("code");
+  int val = server.arg("val").toInt();
+
+  for (int i = 0; i < 17; i++) {
+    if (code.equalsIgnoreCase(jointCodes[i])) {
+      trims[i] = val;
+      writeJointHardware(i, currentAngles[i]);
+      Serial.printf("[TRIM] %s trim updated to %+d\n", jointCodes[i], val);
+      server.send(200, "application/json", "{\"status\":\"ok\"}");
+      return;
+    }
+  }
+  server.send(404, "application/json", "{\"error\":\"Joint not found\"}");
+}
+
+void handleRelease() {
+  releaseServos();
+  server.send(200, "application/json", "{\"status\":\"released\"}");
+}
+
+void handleStatus() {
+  String json = "{\"angles\":{";
+  for (int i = 0; i < 17; i++) {
+    json += "\"" + String(jointCodes[i]) + "\":" + String((int)round(currentAngles[i]));
+    if (i < 16) json += ",";
+  }
+  json += "},\"trims\":{";
+  for (int i = 0; i < 17; i++) {
+    json += "\"" + String(jointCodes[i]) + "\":" + String(trims[i]);
+    if (i < 16) json += ",";
+  }
+  json += "}}";
+  server.send(200, "application/json", json);
+}
+
+// ============================================================================
+// SETUP & LOOP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n[BOOT] Initializing 17-DOF Humanoid Master Controller...");
+
+  // 1. Hardware Init
+  Wire.begin(I2C_SDA, I2C_SCL);
+  pca.begin();
+  pca.setOscillatorFrequency(27000000);
+  pca.setPWMFreq(50);
+
+  ESP32PWM::allocateTimer(0);
+  headServo.setPeriodHertz(50);
+  headServo.attach(HEAD_PIN, 500, 2500);
+
+  // Initialize tracked angles to Stand Pose
+  for (int i = 0; i < 17; i++) {
+    currentAngles[i] = POSE_STAND[i];
+  }
+  for (int i = 0; i < 17; i++) {
+    writeJointHardware(i, currentAngles[i]);
+    delay(70);
+  }
+
+  // 2. Wi-Fi SoftAP Setup
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  IPAddress IP = WiFi.softAPIP();
+
+  Serial.println("\n=======================================================");
+  Serial.println("  17-DOF Humanoid Master Controller is LIVE!");
+  Serial.println("=======================================================");
+  Serial.printf("  SSID     : %s\n", AP_SSID);
+  Serial.printf("  Password : %s\n", AP_PASS);
+  Serial.printf("  Web URL  : http://%s\n", IP.toString().c_str());
+  if (MDNS.begin("humanoid")) {
+    Serial.println("  mDNS URL : http://humanoid.local");
+  }
+  Serial.println("=======================================================\n");
+
+  // 3. Web Server Routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/walk", HTTP_GET, handleWalk);
+  server.on("/api/gaitparams", HTTP_GET, handleGaitParams);
+  server.on("/api/pose", HTTP_GET, handlePose);
+  server.on("/api/joint", HTTP_GET, handleJoint);
+  server.on("/api/trim", HTTP_GET, handleTrim);
+  server.on("/api/release", HTTP_GET, handleRelease);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  updateMotionEngine();
+}
